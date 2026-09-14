@@ -52,6 +52,11 @@ import {
 } from "./gateway-runtime.mts";
 import { validateStandardProfileWorkflowBoundary } from "./standard-profile-workflow-boundary.mts";
 import {
+  isReviewedOpenShellSdkInstallStep,
+  REVIEWED_OPEN_SHELL_SDK_INSTALL_STEP,
+  validateReviewedOpenShellSdkInstallAction,
+} from "./reviewed-openshell-sdk-install-workflow-boundary.mts";
+import {
   validateTrustedHermesSwapHelperSource,
   validateTrustedHermesSwapWorkflow,
 } from "./trusted-hermes-swap-workflow-boundary.mts";
@@ -1315,6 +1320,21 @@ function validateCatalogueOwnedJobs(errors: string[], jobs: WorkflowRecord): voi
   }
 }
 
+function validateExternalGatewayHealthSdkInstall(errors: string[], jobs: WorkflowRecord): void {
+  const jobName = "external-gateway-health";
+  const job = asRecord(jobs[jobName]);
+  if (Object.keys(job).length === 0) return;
+  const sdkInstall = requireJobStep(
+    errors,
+    jobName,
+    asSteps(job.steps),
+    REVIEWED_OPEN_SHELL_SDK_INSTALL_STEP,
+  );
+  if (!isReviewedOpenShellSdkInstallStep(sdkInstall)) {
+    errors.push("external-gateway-health job must install the reviewed SDK with the shared action");
+  }
+}
+
 function jobPassesNvidiaInferenceSecret(job: WorkflowRecord): boolean {
   return asSteps(job.steps).some(
     (step) => asRecord(step.env).NVIDIA_INFERENCE_API_KEY !== undefined,
@@ -1750,7 +1770,7 @@ function validateHermesE2EJob(errors: string[], jobs: WorkflowRecord): void {
     ])
   ) {
     errors.push(
-      "hermes-e2e job must depend on publication, generate-matrix, and reviewed OpenShell SDK validation",
+      "hermes-e2e job must depend on publication, generate-matrix validation, and reviewed SDK packaging",
     );
   }
   if (job.if !== "${{ needs.generate-matrix.outputs.hermes_selected == 'true' }}") {
@@ -1816,19 +1836,23 @@ function validateHermesE2EJob(errors: string[], jobs: WorkflowRecord): void {
     "Download reviewed OpenShell SDK archive",
   );
   if (
-    asRecord(sdkDownload?.with).name !== "${{ needs.package-openshell-sdk.outputs.artifact_name }}"
+    !isDeepStrictEqual(sdkDownload, {
+      name: "Download reviewed OpenShell SDK archive",
+      uses: "actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c",
+      with: {
+        name: "${{ needs.package-openshell-sdk.outputs.artifact_name }}",
+        path: "${{ runner.temp }}/openshell-sdk",
+      },
+    })
   ) {
-    errors.push("hermes-e2e SDK download must use the reviewed package artifact");
+    errors.push("hermes-e2e job must download the run-scoped reviewed SDK archive");
   }
-  if (asRecord(sdkDownload?.with).path !== "${{ runner.temp }}/openshell-sdk") {
-    errors.push("hermes-e2e SDK download must use the isolated runner SDK directory");
+  const sdkInstall = requireJobStep(errors, jobName, steps, REVIEWED_OPEN_SHELL_SDK_INSTALL_STEP);
+  if (!isReviewedOpenShellSdkInstallStep(sdkInstall)) {
+    errors.push(
+      "hermes-e2e job must install the reviewed SDK archive without credentials or package scripts",
+    );
   }
-  requireJobStep(
-    errors,
-    jobName,
-    steps,
-    "Install reviewed OpenShell SDK archive without package credentials",
-  );
   const runVitest = requireJobStep(errors, jobName, steps, "Run Hermes live Vitest test");
   const runVitestEnv = asRecord(runVitest?.env);
   if (runVitestEnv.NVIDIA_INFERENCE_API_KEY !== GUARDED_HERMES_E2E_INFERENCE_KEY) {
@@ -3188,6 +3212,7 @@ export function validateE2eWorkflow(workflowValue: unknown): string[] {
   validateStagingBrevLaunchableJob(errors, jobs);
   validateStagingBrevLaunchableIdentityJob(errors, jobs);
   validateCatalogueOwnedJobs(errors, jobs);
+  validateExternalGatewayHealthSdkInstall(errors, jobs);
   validateHermesE2EJob(errors, jobs);
   validateHermesTimeoutHeadroom(errors, jobs);
 
@@ -3335,6 +3360,7 @@ export function validateE2eWorkflow(workflowValue: unknown): string[] {
 export function validateE2eWorkflowBoundary(workflowPath = DEFAULT_E2E_WORKFLOW_PATH): string[] {
   const workflow = readWorkflowRecord(workflowPath);
   return [
+    ...validateReviewedOpenShellSdkInstallAction(),
     ...validateDockerHubAuthAction(),
     ...validateDockerHubCleanupAction(),
     ...validateHostDependencyAction(),
