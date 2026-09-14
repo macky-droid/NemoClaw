@@ -25,6 +25,7 @@ const dockerControlPath =
 const dockerOperationAuthorityPath =
   require.resolve("../onboard/runtime-provider/docker-operation-authority");
 const dockerRunPath = require.resolve("../adapters/docker/run");
+const dockerExecPath = require.resolve("../adapters/docker/exec");
 const portableLifecyclePath = require.resolve("../onboard/experimental/portable-demo-lifecycle");
 const registryPath = require.resolve("../state/registry");
 const lifecycleGenerationPath = require.resolve("../state/registry/lifecycle-generation");
@@ -79,6 +80,7 @@ function withPrivilegedExecMocks<T>(
   const priorDockerControl = require.cache[dockerControlPath];
   const priorDockerOperationAuthority = require.cache[dockerOperationAuthorityPath];
   const priorDockerRun = require.cache[dockerRunPath];
+  const priorDockerExec = require.cache[dockerExecPath];
   const priorPortableLifecycle = require.cache[portableLifecyclePath];
   const priorRegistry = require.cache[registryPath];
   const priorLifecycleGeneration = require.cache[lifecycleGenerationPath];
@@ -120,6 +122,12 @@ function withPrivilegedExecMocks<T>(
       dockerRun:
         deps.dockerRun ?? (() => ({ status: 0, stdout: "", stderr: "", error: null }) as const),
     },
+  } as any;
+  requireCache[dockerExecPath] = {
+    id: dockerExecPath,
+    filename: dockerExecPath,
+    loaded: true,
+    exports: { dockerSpawnSync: deps.dockerRun },
   } as any;
   requireCache[portableLifecyclePath] = {
     id: portableLifecyclePath,
@@ -199,6 +207,7 @@ function withPrivilegedExecMocks<T>(
     restoreRequireCacheEntry(dockerControlPath, priorDockerControl);
     restoreRequireCacheEntry(dockerOperationAuthorityPath, priorDockerOperationAuthority);
     restoreRequireCacheEntry(dockerRunPath, priorDockerRun);
+    restoreRequireCacheEntry(dockerExecPath, priorDockerExec);
     restoreRequireCacheEntry(portableLifecyclePath, priorPortableLifecycle);
     restoreRequireCacheEntry(registryPath, priorRegistry);
     restoreRequireCacheEntry(lifecycleGenerationPath, priorLifecycleGeneration);
@@ -980,14 +989,29 @@ describe("privileged sandbox exec routing", () => {
   });
 
   it("clears interpreter and dynamic-loader injection variables for root control", () => {
+    const replacementId = "a".repeat(64);
+    const backupId = "b".repeat(64);
+    let argv: readonly string[] = [];
     withPrivilegedExecMocks(
       {
         getSandbox: () => ({ name: "alpha", openshellDriver: "docker" }),
         listSandboxes: () => ({ sandboxes: [{ name: "alpha" }], defaultSandbox: "alpha" }),
-        dockerCapture: () => "immutable-alpha-id\topenshell-alpha\n",
+        dockerCapture: (args) =>
+          args[0] === "inspect"
+            ? `${backupId} exited false false false`
+            : `${replacementId}\topenshell-alpha\n${backupId}\topenshell-alpha-nemoclaw-gpu-backup-123\n`,
+        dockerRun: (args) => {
+          argv = args;
+          return { status: 0, stdout: "", stderr: "", error: null };
+        },
       },
-      ({ privilegedSandboxExecArgv }) => {
-        const argv = privilegedSandboxExecArgv("alpha", ["/trusted/control"], false, true);
+      ({ executePrivilegedSandboxCommand }) => {
+        const result = executePrivilegedSandboxCommand("alpha", ["/trusted/control"], {
+          sanitizeEnvironment: true,
+          expectedResourceHandle: replacementId,
+          retainedDockerBackupId: backupId,
+        });
+        expect(result.status).toBe(0);
         expect(argv.slice(0, 1)).toEqual(["exec"]);
         expect(argv).toContain("LD_PRELOAD=");
         expect(argv).toContain("LD_LIBRARY_PATH=");
@@ -996,33 +1020,27 @@ describe("privileged sandbox exec routing", () => {
         expect(argv).toContain("PYTHONUSERBASE=");
         expect(argv).toContain("PYTHONNOUSERSITE=1");
         expect(argv).toContain("BASH_ENV=");
-        expect(argv.slice(-4)).toEqual([
-          "--user",
-          "root",
-          "immutable-alpha-id",
-          "/trusted/control",
-        ]);
+        expect(argv.slice(-4)).toEqual(["--user", "root", replacementId, "/trusted/control"]);
       },
     );
   });
 
-  it("refuses privileged execution when the pinned container identity changed", () => {
+  it("refuses privileged execution when the retained rollback identity is missing", () => {
+    const backupId = "b".repeat(64);
     withPrivilegedExecMocks(
       {
         getSandbox: () => ({ name: "alpha", openshellDriver: "docker" }),
         listSandboxes: () => ({ sandboxes: [{ name: "alpha" }], defaultSandbox: "alpha" }),
-        dockerCapture: () => "current-container-id\topenshell-alpha\n",
+        dockerCapture: () => `${"a".repeat(64)}\topenshell-alpha\n`,
       },
-      ({ isPinnedSandboxContainerIdentityChangedError, privilegedSandboxExecArgv }) => {
+      ({ isPinnedSandboxContainerIdentityChangedError, executePrivilegedSandboxCommand }) => {
         let refusal: unknown;
         try {
-          privilegedSandboxExecArgv(
-            "alpha",
-            ["/trusted/control"],
-            false,
-            true,
-            "previous-container-id",
-          );
+          executePrivilegedSandboxCommand("alpha", ["/trusted/control"], {
+            sanitizeEnvironment: true,
+            expectedResourceHandle: "a".repeat(64),
+            retainedDockerBackupId: backupId,
+          });
         } catch (error) {
           refusal = error;
         }

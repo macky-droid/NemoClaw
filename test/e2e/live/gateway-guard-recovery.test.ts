@@ -298,7 +298,7 @@ test(
         "validate recovered guard and stable PID",
         "restart sandbox container with persisted startup command",
         "recover managed supervisor and inference",
-        "recreate and restart sandbox container with legacy keepalive",
+        "recreate sandbox container with legacy keepalive",
         "recover legacy managed supervisor and inference",
       ],
     },
@@ -451,11 +451,25 @@ test(
       artifactName: "restart-stop-dashboard-forward",
       env: buildAvailabilityProbeEnv(),
     });
-    const restart = await host.command("docker", ["restart", originalContainerId], {
-      artifactName: "restart-docker-restart",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 120_000,
-    });
+    // Keep OpenShell's durable phase out of Error while Docker restarts the
+    // registered main process. Docker still reuses the exact persisted command.
+    const restart = await host.command(
+      "bash",
+      [
+        "-eu",
+        "-c",
+        '"$1" sandbox stop "$2"\ndocker restart "$3"\n"$1" sandbox start "$2"',
+        "persisted-startup-restart",
+        host.openshellCommandPath,
+        instance.sandboxName,
+        originalContainerId,
+      ],
+      {
+        artifactName: "restart-docker-handoff",
+        env: buildAvailabilityProbeEnv(),
+        timeoutMs: 120_000,
+      },
+    );
     expect(restart.exitCode, resultText(restart)).toBe(0);
     await waitForSandboxExecReady(host, instance.sandboxName, progress, "restart-openshell-ready");
 
@@ -537,11 +551,13 @@ test(
       resultText(inference),
     ).toBe(true);
 
-    progress.phase("recreate and restart sandbox container with legacy keepalive");
-    // ── Assert #6635 legacy Docker restart recovery ────────────────
+    progress.phase("recreate sandbox container with legacy keepalive");
+    // ── Assert #6635 legacy keepalive migration ────────────────
     // Existing sandboxes may still persist the historical keepalive. Recreate
     // that exact state from the identity-pinned modern container so recovery
     // proves the compatibility migration independently of fresh onboarding.
+    // The fixture also removes modern image/profile metadata, matching the
+    // pre-profile #6635 sandbox while preserving its container ownership.
     await host.cleanupForward(18789, {
       artifactName: "legacy-restart-stop-dashboard-forward",
       env: buildAvailabilityProbeEnv(),
@@ -557,10 +573,10 @@ test(
     );
     expect(createLegacyKeepalive.exitCode, resultText(createLegacyKeepalive)).toBe(0);
     const handoffReceipt = parseLegacyKeepaliveHandoffReceipt(createLegacyKeepalive.stdout);
+    expect(handoffReceipt.oldContainerId).toBe(recoveredContainerId);
     expect(handoffReceipt.newContainerId).toMatch(/^[0-9a-f]{64}$/iu);
-    // Do not overlap the fixture's recreation with the restart below. The
-    // fixture runs in its own process, so the host must observe the replacement
-    // through OpenShell before starting the next container lifecycle transition.
+    // The fixture already restarts the replacement through OpenShell. Another
+    // raw Docker restart would turn the keepalive's exit into terminal Error.
     await waitForSandboxExecReady(
       host,
       instance.sandboxName,
@@ -574,18 +590,6 @@ test(
     expect(
       await inspectStartupCommand(host, legacyContainerId, "legacy-restart-command-before"),
     ).toBe("sleep infinity");
-    const legacyRestart = await host.command("docker", ["restart", legacyContainerId], {
-      artifactName: "legacy-restart-docker-restart",
-      env: buildAvailabilityProbeEnv(),
-      timeoutMs: 120_000,
-    });
-    expect(legacyRestart.exitCode, resultText(legacyRestart)).toBe(0);
-    await waitForSandboxExecReady(
-      host,
-      instance.sandboxName,
-      progress,
-      "legacy-restart-openshell-ready",
-    );
     await gateway.waitForMissingManagedSupervisor(legacyContainerId, {
       onRetry: (attempt) => progress.event(`managed supervisor absence proof retry ${attempt}`),
     });

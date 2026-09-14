@@ -5,11 +5,13 @@ import { afterEach, describe, expect, it, vi } from "vitest";
 import type { DockerGpuPatchFinalizeOutcome } from "../../onboard/docker-gpu-patch-finalize";
 import type { DockerGpuPatchResult } from "../../onboard/docker-gpu-patch";
 import * as registry from "../../state/registry";
+import * as privilegedExec from "../../sandbox/privileged-exec";
 import {
   type ManagedSupervisorRelaunchDeps,
   relaunchManagedSupervisorSession,
 } from "./supervisor-relaunch";
 import * as backupAuthority from "./snapshot/backup-authority";
+import * as sandboxState from "../../state/sandbox";
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -34,6 +36,13 @@ function patchResult(): DockerGpuPatchResult {
 }
 
 function baseDeps(overrides: ManagedSupervisorRelaunchDeps = {}) {
+  let currentContainerId = "old-container-id";
+  const finalize: NonNullable<ManagedSupervisorRelaunchDeps["finalize"]> =
+    overrides.finalize ??
+    (async ({ supervisorReady }) =>
+      supervisorReady
+        ? { backupRemoved: true, finalHandoffAcknowledged: true, rolledBack: false }
+        : { backupRemoved: false, rolledBack: true });
   return {
     getSandbox: vi.fn(() => ({
       name: "alpha",
@@ -50,10 +59,7 @@ function baseDeps(overrides: ManagedSupervisorRelaunchDeps = {}) {
         }) as never,
     ),
     resolveDashboardPort: vi.fn(() => 18789),
-    resolveContainer: vi
-      .fn()
-      .mockReturnValueOnce("old-container-id")
-      .mockReturnValue("new-container-id"),
+    resolveContainer: vi.fn(() => currentContainerId),
     inspectContainer: vi.fn(() => ({
       Config: { Env: ["OPENSHELL_SANDBOX_COMMAND=sleep infinity"] },
     })),
@@ -86,13 +92,18 @@ function baseDeps(overrides: ManagedSupervisorRelaunchDeps = {}) {
     },
     runOpenshell: vi.fn(() => ({ status: 0, stdout: "No sandboxes found.\n" })),
     runCaptureOpenshell: vi.fn(() => "alpha  2026-08-23 10:00:00  Ready\n"),
-    recreate: vi.fn(() => patchResult()),
-    finalize: vi.fn(async ({ supervisorReady }) =>
-      supervisorReady
-        ? { backupRemoved: true, finalHandoffAcknowledged: true, rolledBack: false }
-        : { backupRemoved: false, rolledBack: true },
-    ),
+    recreate: vi.fn(() => {
+      currentContainerId = "new-container-id";
+      return patchResult();
+    }),
     ...overrides,
+    finalize: vi.fn(
+      async (...args: Parameters<NonNullable<ManagedSupervisorRelaunchDeps["finalize"]>>) => {
+        const outcome = await finalize(...args);
+        currentContainerId = outcome.rolledBack ? "old-container-id" : currentContainerId;
+        return outcome;
+      },
+    ),
   } satisfies ManagedSupervisorRelaunchDeps;
 }
 
@@ -117,7 +128,12 @@ describe("relaunchManagedSupervisorSession", () => {
   it("refuses a container that no longer has the legacy keepalive startup", () => {
     const deps = baseDeps({
       inspectContainer: vi.fn(() => ({
-        Config: { Env: ["OPENSHELL_SANDBOX_COMMAND=env nemoclaw-start"] },
+        Config: {
+          Env: [
+            "OPENSHELL_SANDBOX_COMMAND=sleep infinity",
+            'OPENSHELL_MAIN_PROCESS_SPEC={"version":1,"command":["env","nemoclaw-start"],"tty":false}',
+          ],
+        },
       })),
     });
 
@@ -138,12 +154,26 @@ describe("relaunchManagedSupervisorSession", () => {
     vi.stubEnv("CUSTOM_PROVIDER_CREDENTIAL", "s3cr3t-token");
     vi.stubEnv("HTTPS_PROXY", "http://proxyuser:proxypass@proxy.example:8080");
     const deps = baseDeps();
+    vi.mocked(deps.inspectContainer).mockReturnValue({
+      Config: {
+        Env: [
+          'OPENSHELL_MAIN_PROCESS_SPEC={"version":1,"command":["sleep","infinity"],"tty":false}',
+        ],
+      },
+    });
 
     const relaunch = relaunchManagedSupervisorSession("alpha", { quiet: true, deps });
 
     expect(relaunch).not.toBeNull();
     expect(relaunch?.containerId).toBe("new-container-id");
     expect(deps.recreate).toHaveBeenCalledOnce();
+    expect(deps.runOpenshell).toHaveBeenCalledWith(
+      ["sandbox", "stop", "alpha"],
+      expect.objectContaining({ timeout: 900000, killProcessTreeOnTimeout: true }),
+    );
+    expect(vi.mocked(deps.runOpenshell).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(deps.recreate).mock.invocationCallOrder[0],
+    );
     const options = vi.mocked(deps.recreate).mock.calls[0]?.[0];
     expect(options).toMatchObject({
       sandboxName: "alpha",
@@ -164,7 +194,10 @@ describe("relaunchManagedSupervisorSession", () => {
       stateRestored: true,
       stateBackupRemoved: true,
     });
-    expect(deps.restoreState).toHaveBeenCalledWith("alpha", "/tmp/rebuild-backups/alpha/recovery");
+    expect(deps.restoreState).toHaveBeenCalledWith("alpha", "/tmp/rebuild-backups/alpha/recovery", {
+      targetAgentType: "openclaw",
+      runCommand: expect.any(Function),
+    });
     expect(deps.removeBackup).toHaveBeenCalledWith("alpha", "/tmp/rebuild-backups/alpha/recovery");
     expect(deps.finalize).toHaveBeenCalledWith(
       {
@@ -181,7 +214,7 @@ describe("relaunchManagedSupervisorSession", () => {
     );
   });
 
-  it("uses managed backup authority for default supervisor recovery", () => {
+  it("uses managed backup authority and the pinned sandbox user for default recovery", async () => {
     vi.stubEnv("NEMOCLAW_HERMES_API_PORT", "8642");
     vi.spyOn(registry, "getSandbox").mockReturnValue({ hermesApiPort: 8642 } as never);
     const managedBackup = vi
@@ -194,14 +227,15 @@ describe("relaunchManagedSupervisorSession", () => {
         backedUpFiles: [],
         failedFiles: [],
       } as never);
-    const getSandbox = vi.fn(() => ({
+    const getSandbox = vi.fn((_name: string) => ({
       name: "alpha",
       agent: "hermes",
       dashboardPort: 18789,
       openshellDriver: "docker",
-    })) as never;
+    }));
     const deps = baseDeps({
       backupState: undefined,
+      restoreState: undefined,
       getSandbox,
       getSessionAgent: vi.fn(
         () =>
@@ -213,7 +247,70 @@ describe("relaunchManagedSupervisorSession", () => {
       ),
     });
 
-    expect(relaunchManagedSupervisorSession("alpha", { quiet: true, deps })).not.toBeNull();
+    const execution = vi.spyOn(privilegedExec, "executePrivilegedSandboxCommand").mockReturnValue({
+      status: 0,
+      signal: null,
+      stdout: Buffer.from("restored"),
+      stderr: Buffer.alloc(0),
+    });
+    const restore = vi
+      .spyOn(sandboxState, "restoreRecreatedSandboxState")
+      .mockImplementation((_name, _path, options) => {
+        const result = options.runCommand!("restore-command", {
+          input: Buffer.from("state"),
+          timeout: 30000,
+          maxBuffer: 1024,
+        });
+        expect(result.status).toBe(0);
+        return {
+          success: true,
+          restoredDirs: ["memories"],
+          failedDirs: [],
+          restoredFiles: [],
+          failedFiles: [],
+        };
+      });
+    const relaunch = relaunchManagedSupervisorSession("alpha", { quiet: true, deps });
+    expect(relaunch).not.toBeNull();
+    expect(await relaunch?.finalize(true)).toMatchObject({
+      stateRestored: true,
+      backupRemoved: true,
+    });
+    expect(restore).toHaveBeenCalledWith(
+      "alpha",
+      managedBackup.mock.results[0]?.value.manifest.backupPath,
+      expect.objectContaining({ targetAgentType: "hermes", runCommand: expect.any(Function) }),
+    );
+    expect(execution).toHaveBeenCalledWith(
+      "alpha",
+      [
+        "/usr/bin/setpriv",
+        "--reuid=sandbox",
+        "--regid=sandbox",
+        "--init-groups",
+        "--no-new-privs",
+        "--",
+        "/usr/bin/env",
+        "-i",
+        "HOME=/sandbox",
+        "PATH=/usr/local/bin:/usr/bin:/bin",
+        "/bin/sh",
+        "-c",
+        "restore-command",
+      ],
+      {
+        expectedResourceHandle: "new-container-id",
+        retainedDockerBackupId: "old-container-id",
+        sanitizeEnvironment: true,
+        input: Buffer.from("state"),
+        timeout: 30000,
+        maxOutputBytes: 1024,
+      },
+    );
+    expect(deps.resolveContainer).toHaveBeenLastCalledWith("alpha", "docker", {
+      expectedResourceHandle: "new-container-id",
+      retainedDockerBackupId: "old-container-id",
+    });
     expect(managedBackup).toHaveBeenCalledWith("alpha", {}, { getSandbox });
     expect(deps.recreate).toHaveBeenCalledOnce();
   });
@@ -545,13 +642,18 @@ describe("relaunchManagedSupervisorSession", () => {
     });
     const relaunch = relaunchManagedSupervisorSession("alpha", { quiet: true, deps });
 
+    expect(relaunch?.retainedDockerBackupId).toBe("old-container-id");
     expect(await relaunch?.finalize(true)).toMatchObject({
       backupRemoved: true,
       rolledBack: false,
       stateRestored: true,
     });
+    expect(relaunch?.retainedDockerBackupId).toBeUndefined();
     expect(order).toEqual(["restore-state", "restart-restored-gateway", "commit-container"]);
-    expect(deps.restartRestoredManagedGateway).toHaveBeenCalledWith("new-container-id");
+    expect(deps.restartRestoredManagedGateway).toHaveBeenCalledWith(
+      "new-container-id",
+      "old-container-id",
+    );
     expect(deps.finalize).toHaveBeenCalledWith(
       {
         finalHandoffTimeoutSecs: 900,
@@ -628,7 +730,9 @@ describe("relaunchManagedSupervisorSession", () => {
       resolveContainer: vi
         .fn()
         .mockReturnValueOnce("old-container-id")
-        .mockReturnValue("different-container-id"),
+        .mockReturnValueOnce("old-container-id")
+        .mockReturnValueOnce("new-container")
+        .mockReturnValue("old-container-id"),
     });
     const relaunch = relaunchManagedSupervisorSession("alpha", { quiet: true, deps });
 
@@ -702,6 +806,10 @@ describe("relaunchManagedSupervisorSession", () => {
     });
 
     expect(relaunchManagedSupervisorSession("alpha", { quiet: true, deps })).toBeNull();
+    expect(vi.mocked(deps.runOpenshell).mock.calls.map(([args]) => args)).toEqual([
+      ["sandbox", "stop", "alpha"],
+      ["sandbox", "start", "alpha"],
+    ]);
     expect(deps.removeBackup).toHaveBeenCalledWith("alpha", "/tmp/rebuild-backups/alpha/recovery");
   });
 

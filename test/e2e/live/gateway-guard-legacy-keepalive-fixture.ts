@@ -2,12 +2,12 @@
 // SPDX-License-Identifier: Apache-2.0
 
 import path from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import { pathToFileURL } from "node:url";
 
 import * as dockerRunNamespace from "../../../src/lib/adapters/docker/run.ts";
 import * as openshellRuntimeNamespace from "../../../src/lib/adapters/openshell/runtime.ts";
 import * as sandboxCommandCliNamespace from "../../../src/lib/adapters/openshell/sandbox-command-cli.ts";
-import * as dockerCommandResultNamespace from "../../../src/lib/onboard/docker-command-result.ts";
 import * as managedBootstrapAdapterNamespace from "../../../src/lib/onboard/managed-bootstrap/adapter.ts";
 import * as dockerGpuPatchCloneNamespace from "../../../src/lib/onboard/docker-gpu-patch-clone.ts";
 import * as dockerGpuPatchFinalizeNamespace from "../../../src/lib/onboard/docker-gpu-patch-finalize.ts";
@@ -17,6 +17,9 @@ import type {
 } from "../../../src/lib/onboard/docker-gpu-patch-types.ts";
 import * as startupCommandEnvNamespace from "../../../src/lib/onboard/docker-startup-command-env.ts";
 import * as startupCommandPatchNamespace from "../../../src/lib/onboard/docker-startup-command-patch.ts";
+import * as registryNamespace from "../../../src/lib/state/registry.ts";
+import * as privilegedExecNamespace from "../../../src/lib/sandbox/privileged-exec.ts";
+import * as workloadAuthorityNamespace from "../../../src/lib/onboard/workload/authority.ts";
 import { redactString } from "../fixtures/redaction.ts";
 
 const LEGACY_KEEPALIVE_COMMAND = ["sleep", "infinity"] as const;
@@ -29,60 +32,33 @@ const OPENSHELL_OCI_IMAGE_USER_ENV = "OPENSHELL_OCI_IMAGE_USER";
 const MANAGED_STARTUP_ENV_KEY = /^[A-Za-z_][A-Za-z0-9_]*$/u;
 const DEFAULT_RECREATE_TIMEOUT_SECS = 180;
 const DOCKER_CONTAINER_ID_PATTERN = /^[0-9a-f]{64}$/i;
-const managedBootstrapAdapter = (
-  "default" in managedBootstrapAdapterNamespace
-    ? managedBootstrapAdapterNamespace.default
-    : managedBootstrapAdapterNamespace
-) as typeof import("../../../src/lib/onboard/managed-bootstrap/adapter.ts");
-const { assertManagedBootstrapSafeProcessEnvironmentKey } = managedBootstrapAdapter;
-const dockerGpuPatchClone = (
-  "default" in dockerGpuPatchCloneNamespace
-    ? dockerGpuPatchCloneNamespace.default
-    : dockerGpuPatchCloneNamespace
-) as typeof import("../../../src/lib/onboard/docker-gpu-patch-clone.ts");
-const { shouldOmitOpenShellOciImageUser } = dockerGpuPatchClone;
-const dockerGpuPatchFinalize = (
-  "default" in dockerGpuPatchFinalizeNamespace
-    ? dockerGpuPatchFinalizeNamespace.default
-    : dockerGpuPatchFinalizeNamespace
-) as typeof import("../../../src/lib/onboard/docker-gpu-patch-finalize.ts");
-const { finalizeDockerGpuPatchBackup } = dockerGpuPatchFinalize;
-const startupCommandEnv = (
-  "default" in startupCommandEnvNamespace
-    ? startupCommandEnvNamespace.default
-    : startupCommandEnvNamespace
-) as typeof import("../../../src/lib/onboard/docker-startup-command-env.ts");
+// Standalone tsx exposes CJS exports under default; Vitest exposes the namespace.
+function moduleExports<T extends object>(namespace: T): T {
+  return ("default" in namespace ? namespace.default : namespace) as T;
+}
+
+const { assertManagedBootstrapSafeProcessEnvironmentKey } = moduleExports(
+  managedBootstrapAdapterNamespace,
+);
+const { shouldOmitOpenShellOciImageUser } = moduleExports(dockerGpuPatchCloneNamespace);
+const { finalizeDockerGpuPatchBackup, runOpenShellLifecycleCommand } = moduleExports(
+  dockerGpuPatchFinalizeNamespace,
+);
+const startupCommandEnv = moduleExports(startupCommandEnvNamespace);
 const {
   openshellMainProcessSpecEnvValue,
   openshellSandboxCommandEnvValue,
   parseOpenShellMainProcessSpecEnvValue,
 } = startupCommandEnv;
-const startupCommandPatch = (
-  "default" in startupCommandPatchNamespace
-    ? startupCommandPatchNamespace.default
-    : startupCommandPatchNamespace
-) as typeof import("../../../src/lib/onboard/docker-startup-command-patch.ts");
-const { recreateOpenShellDockerSandboxWithStartupCommand } = startupCommandPatch;
-const dockerRun = (
-  "default" in dockerRunNamespace ? dockerRunNamespace.default : dockerRunNamespace
-) as typeof import("../../../src/lib/adapters/docker/run.ts");
-const { dockerCapture: defaultDockerCapture } = dockerRun;
-const dockerCommandResult = (
-  "default" in dockerCommandResultNamespace
-    ? dockerCommandResultNamespace.default
-    : dockerCommandResultNamespace
-) as typeof import("../../../src/lib/onboard/docker-command-result.ts");
-const { hasZeroDockerExitStatus } = dockerCommandResult;
-const openshellRuntime = (
-  "default" in openshellRuntimeNamespace
-    ? openshellRuntimeNamespace.default
-    : openshellRuntimeNamespace
-) as typeof import("../../../src/lib/adapters/openshell/runtime.ts");
-const { createCliOpenShellSandboxCommandExecutor } = (
-  "default" in sandboxCommandCliNamespace
-    ? sandboxCommandCliNamespace.default
-    : sandboxCommandCliNamespace
-) as typeof import("../../../src/lib/adapters/openshell/sandbox-command-cli.ts");
+const { recreateOpenShellDockerSandboxWithStartupCommand } = moduleExports(
+  startupCommandPatchNamespace,
+);
+const { dockerCapture: defaultDockerCapture } = moduleExports(dockerRunNamespace);
+const openshellRuntime = moduleExports(openshellRuntimeNamespace);
+const { createCliOpenShellSandboxCommandExecutor } = moduleExports(sandboxCommandCliNamespace);
+const registry = moduleExports(registryNamespace);
+const { resolveDirectSandboxContainer } = moduleExports(privilegedExecNamespace);
+const { readManagedWorkloadAuthority } = moduleExports(workloadAuthorityNamespace);
 
 type StartupCommandRecreate = typeof recreateOpenShellDockerSandboxWithStartupCommand;
 type DockerGpuPatchFinalize = typeof finalizeDockerGpuPatchBackup;
@@ -107,6 +83,7 @@ export type LegacyKeepaliveFixtureDeps = {
   runOpenshell: NonNullable<DockerGpuPatchDeps["runOpenshell"]>;
   runCaptureOpenshell: NonNullable<DockerGpuPatchDeps["runCaptureOpenshell"]>;
   finalize: DockerGpuPatchFinalize;
+  recordLegacyWorkload: (sandboxName: string, containerId: string) => void;
 };
 
 const defaultDeps: LegacyKeepaliveFixtureDeps = {
@@ -121,7 +98,42 @@ const defaultDeps: LegacyKeepaliveFixtureDeps = {
       timeout: typeof options?.timeout === "number" ? options.timeout : undefined,
     }).output,
   finalize: finalizeDockerGpuPatchBackup,
+  recordLegacyWorkload,
 };
+
+/** #6635 predates managed profile receipts; keep fixture metadata in that generation. */
+function recordLegacyWorkload(sandboxName: string, containerId: string): void {
+  registry.withLock(() => {
+    const data = registry.load();
+    const entry = data.sandboxes[sandboxName];
+    requireFixtureInput(
+      Boolean(entry) && entry.name === sandboxName,
+      "legacy fixture registry owner is missing",
+    );
+    requireFixtureInput(
+      resolveDirectSandboxContainer(sandboxName, entry.openshellDriver ?? null, {
+        expectedResourceHandle: containerId,
+      }) === containerId,
+      "legacy fixture replacement ownership changed",
+    );
+    if (!readManagedWorkloadAuthority(entry)) return;
+    requireFixtureInput(
+      entry.agent === "openclaw" && !entry.hostLocalInferenceReceipt,
+      "legacy fixture requires a cloud OpenClaw workload",
+    );
+    // Historical entries had no managed profile receipt. This fixture reuses
+    // a shared image, so it must not claim per-sandbox image cleanup ownership.
+    const replacement = { ...entry };
+    delete replacement.imageTag;
+    delete replacement.workload;
+    data.sandboxes[sandboxName] = replacement;
+    registry.save(data);
+    requireFixtureInput(
+      isDeepStrictEqual(registry.load().sandboxes[sandboxName], replacement),
+      "legacy fixture workload identity did not persist",
+    );
+  });
+}
 
 function requireFixtureInput(condition: boolean, message: string): asserts condition {
   if (!condition) throw new Error(message);
@@ -361,26 +373,6 @@ function legacyKeepaliveDockerCapture(
   };
 }
 
-function runFixtureLifecycleCommand(
-  runOpenshell: NonNullable<DockerGpuPatchDeps["runOpenshell"]>,
-  args: string[],
-  timeoutSecs: number,
-): boolean {
-  try {
-    return hasZeroDockerExitStatus(
-      runOpenshell(args, {
-        ignoreError: true,
-        killProcessTreeOnTimeout: true,
-        killSignal: "SIGKILL",
-        suppressOutput: true,
-        timeout: Math.max(1, Math.round(timeoutSecs * 1000)),
-      }),
-    );
-  } catch {
-    return false;
-  }
-}
-
 export async function createLegacyKeepaliveFixture(
   options: LegacyKeepaliveFixtureOptions,
   deps: Partial<LegacyKeepaliveFixtureDeps> = defaultDeps,
@@ -411,7 +403,11 @@ export async function createLegacyKeepaliveFixture(
   // finalizer below then makes OpenShell own the exact replacement start and
   // withholds success until both OpenShell Ready and Docker identity agree.
   requireFixtureInput(
-    runFixtureLifecycleCommand(runOpenshell, ["sandbox", "stop", options.sandboxName], timeoutSecs),
+    runOpenShellLifecycleCommand(
+      runOpenshell,
+      ["sandbox", "stop", options.sandboxName],
+      timeoutSecs,
+    ),
     "legacy keepalive fixture could not stop the sandbox through OpenShell before recreation",
   );
 
@@ -432,7 +428,7 @@ export async function createLegacyKeepaliveFixture(
       // The recreation helper restores the original Docker container before it
       // rejects. Re-enter the OpenShell lifecycle here, while preserving the
       // original failure as the authoritative error for the caller.
-      runFixtureLifecycleCommand(
+      runOpenShellLifecycleCommand(
         runOpenshell,
         ["sandbox", "start", options.sandboxName],
         timeoutSecs,
@@ -472,6 +468,10 @@ export async function createLegacyKeepaliveFixture(
         ? `; last sandbox phase was ${finalization.lastSandboxPhase}`
         : ""
     }`,
+  );
+  (deps.recordLegacyWorkload ?? defaultDeps.recordLegacyWorkload)(
+    options.sandboxName,
+    result.newContainerId,
   );
   return { ...result, backupRemoved: true };
 }
