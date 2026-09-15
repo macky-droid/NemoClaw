@@ -29,7 +29,10 @@ import {
   type RecreateGpuPatchFn,
   type RecreateStartupPatchFn,
 } from "./docker-startup-command-sandbox-create";
-import { ManagedBootstrapOwnerCleanupRequiredError } from "./managed-bootstrap/adapter";
+import {
+  attachManagedBootstrapRollbackError,
+  ManagedBootstrapOwnerCleanupRequiredError,
+} from "./managed-bootstrap/adapter";
 import type {
   ManagedBootstrapNativeGpuFallbackRollbackOutcome,
   ManagedBootstrapNativeGpuFallbackRollbackRequest,
@@ -290,13 +293,12 @@ export function createDockerGpuSandboxCreatePatch(
 
   const reportPatchErrorAndExit = async (): Promise<void> => {
     if (!patchError) return;
+    const failure = patchError instanceof Error ? patchError : new Error(String(patchError));
     const rollbackError = await rollbackAfterFailure();
     if (rollbackError) {
-      patchError = new Error(
-        `${patchError instanceof Error ? patchError.message : String(patchError)}; managed startup rollback failed: ${rollbackError.message}`,
-      );
+      attachManagedBootstrapRollbackError(failure, rollbackError);
     }
-    onPatchFailureExit(options.sandboxName, patchError, {
+    onPatchFailureExit(options.sandboxName, failure, {
       runCaptureOpenshell: options.deps.runCaptureOpenshell,
       dockerCapture: options.deps.dockerCapture,
       additionalSummaryLines: routeAdapter.additionalSummaryLines,
@@ -508,9 +510,7 @@ export function createDockerGpuSandboxCreatePatch(
                 rollbackFailure instanceof Error
                   ? rollbackFailure
                   : new Error(String(rollbackFailure));
-              (
-                failure as Error & { managedBootstrapRollbackError?: unknown }
-              ).managedBootstrapRollbackError = rollbackError;
+              attachManagedBootstrapRollbackError(failure, rollbackError);
             }
             cutoverFinalizationFailure = failure;
             onPatchFailureExit(options.sandboxName, failure, {
@@ -636,10 +636,8 @@ export function createDockerGpuSandboxCreatePatch(
           });
           const rollbackError = await rollbackAfterFailure();
           if (rollbackError) {
+            attachManagedBootstrapRollbackError(failure, rollbackError);
             console.error(`  ${rollbackError.message}`);
-            (
-              failure as Error & { managedBootstrapRollbackError?: unknown }
-            ).managedBootstrapRollbackError = rollbackError;
           }
           throw failure;
         }
@@ -662,10 +660,8 @@ export function createDockerGpuSandboxCreatePatch(
         });
         const rollbackError = await rollbackAfterFailure();
         if (rollbackError) {
+          attachManagedBootstrapRollbackError(failure, rollbackError);
           console.error(`  ${rollbackError.message}`);
-          (
-            failure as Error & { managedBootstrapRollbackError?: unknown }
-          ).managedBootstrapRollbackError = rollbackError;
         }
         throw failure;
       }
