@@ -66,12 +66,15 @@ export function replaceInputBeforeRead(root: string, linked: boolean) {
   return replace;
 }
 
-export function changeInputDuringRead() {
+export function changeInputDuringRead(file: string) {
+  const expected = fs.statSync(file);
   const change = vi.fn((descriptor: number) => fs.fchmodSync(descriptor, 0o600));
   const read = fs.readFileSync;
   vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
     const bytes = read(...args);
-    if (typeof args[0] === "number" && change.mock.calls.length === 0) change(args[0]);
+    const stat = typeof args[0] === "number" ? fs.fstatSync(args[0]) : undefined;
+    if (stat?.dev === expected.dev && stat.ino === expected.ino && change.mock.calls.length === 0)
+      change(args[0] as number);
     return bytes;
   });
   return change;
@@ -87,4 +90,43 @@ export function observeInputReads(file: string) {
     return read(...args);
   });
   return observed;
+}
+
+export function observeHighPrecisionIdentity(file: string) {
+  const expected = fs.statSync(file);
+  let dev = 9_007_199_254_740_992n;
+  let ino = 9_007_199_254_740_992n;
+  const matches = (stat: fs.Stats | fs.BigIntStats) =>
+    stat.dev.toString() === expected.dev.toString() &&
+    stat.ino.toString() === expected.ino.toString();
+  const replace = (stat: fs.Stats | fs.BigIntStats | undefined) => {
+    if (!stat) return stat;
+    if (matches(stat)) {
+      Object.defineProperty(stat, "dev", { value: dev });
+      Object.defineProperty(stat, "ino", { value: ino });
+    }
+    return stat;
+  };
+  const lstat = fs.lstatSync;
+  vi.spyOn(fs, "lstatSync").mockImplementation((...args: Parameters<typeof fs.lstatSync>) =>
+    replace(lstat(...args) as fs.Stats | fs.BigIntStats | undefined),
+  );
+  const fstat = fs.fstatSync;
+  vi.spyOn(fs, "fstatSync").mockImplementation((...args: Parameters<typeof fs.fstatSync>) =>
+    replace(fstat(...args) as fs.Stats | fs.BigIntStats)!,
+  );
+  const reads = vi.fn();
+  const read = fs.readFileSync;
+  vi.spyOn(fs, "readFileSync").mockImplementation((...args: Parameters<typeof fs.readFileSync>) => {
+    const stat = typeof args[0] === "number" ? fstat(args[0]) : undefined;
+    if (stat && matches(stat)) reads();
+    return read(...args);
+  });
+  return {
+    reads,
+    set(devValue: bigint, inoValue: bigint) {
+      dev = devValue;
+      ino = inoValue;
+    },
+  };
 }
