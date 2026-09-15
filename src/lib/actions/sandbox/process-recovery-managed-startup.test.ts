@@ -8,6 +8,8 @@ import * as openshellResolve from "../../adapters/openshell/resolve";
 import * as openshellRuntime from "../../adapters/openshell/runtime";
 import * as agentRuntime from "../../agent/runtime";
 import * as wait from "../../core/wait";
+import * as gatewayTeardownAuthority from "../../onboard/gateway-teardown-authority";
+import * as runtimeProviderSelection from "../../onboard/runtime-provider/selection";
 import * as registry from "../../state/registry";
 import * as forwardHealth from "./forward-health";
 import {
@@ -28,7 +30,11 @@ const PENDING_MANAGED_CONTAINER_DISCOVERY = {
   managedContainerDiscoveryUnavailable: true,
 } as const;
 
-function mockGatewaySandbox(sandboxName: string, agent: "openclaw" | "hermes" = "openclaw"): void {
+function mockGatewaySandbox(
+  sandboxName: string,
+  agent: "openclaw" | "hermes" = "openclaw",
+  openshellDriver = "docker",
+): void {
   const port = agent === "hermes" ? 8642 : 18789;
   vi.spyOn(agentRuntime, "getSessionAgent").mockReturnValue({
     name: agent,
@@ -44,11 +50,23 @@ function mockGatewaySandbox(sandboxName: string, agent: "openclaw" | "hermes" = 
     name: sandboxName,
     agent,
     dashboardPort: port,
-    openshellDriver: "docker",
+    openshellDriver,
   });
 }
 
 function mockRecoveredForward(_sandboxName: string): void {
+  vi.spyOn(gatewayTeardownAuthority, "resolveGatewayForwardAuthority").mockImplementation(
+    ({ gatewayName, gatewayPort }) => ({
+      gatewayName,
+      gatewayPort,
+      mode: "nemoclaw-managed",
+      source: "standalone",
+      endpoint: null,
+      stateDir: null,
+      supervisor: null,
+      requiredCapabilities: [],
+    }),
+  );
   vi.spyOn(forwardHealth, "isLocalForwardReachable").mockReturnValue(true);
   vi.spyOn(forwardService, "isForwardServiceListenerOwner").mockReturnValue(true);
   vi.spyOn(openshellResolve, "resolveOpenshell").mockReturnValue("/usr/bin/openshell");
@@ -64,6 +82,157 @@ afterEach(() => {
 });
 
 describe("checkAndRecoverSandboxProcesses managed startup", () => {
+  it.each(["kubernetes", "mxc", "unknown-provider"])(
+    "does not invoke the managed controller for the unsupported %s recovery surface",
+    async (openshellDriver) => {
+      const sandboxName = `${openshellDriver}-box`;
+      mockGatewaySandbox(sandboxName, "openclaw", openshellDriver);
+      const requestGatewaySupervisorAction = vi.fn();
+
+      const result = await checkAndRecoverSandboxProcesses(sandboxName, {
+        quiet: true,
+        isSandboxGatewayRunningImpl: async () => false,
+        requestGatewaySupervisorAction,
+      });
+
+      expect(result).toMatchObject({
+        checked: true,
+        wasRunning: false,
+        recovered: false,
+        forwardRecovered: false,
+        recoveryFailureDetail: expect.any(String),
+      });
+      expect(requestGatewaySupervisorAction).not.toHaveBeenCalled();
+    },
+  );
+
+  it("dispatches Podman provider recovery through the public recovery boundary", async () => {
+    const sandboxName = "podman-box";
+    mockGatewaySandbox(sandboxName, "openclaw", "podman");
+    mockRecoveredForward(sandboxName);
+    const recover = vi.fn(() => ({ exitCode: 0 }));
+    vi.spyOn(runtimeProviderSelection, "resolveRegisteredRuntimeProvider").mockReturnValue({
+      gateway: { supported: true, launcher: "nemoclaw" },
+      lifecycle: { supported: true },
+      recovery: { supported: true, recover },
+    } as never);
+    const requestGatewaySupervisorAction = vi.fn();
+    const waitForRecoveredSandboxGatewayImpl = vi.fn(async () => true);
+    const waitForRecreatedSandboxOpenShellReadyImpl = vi.fn(async () => true);
+
+    const result = await checkAndRecoverSandboxProcesses(sandboxName, {
+      quiet: true,
+      isSandboxGatewayRunningImpl: async () => false,
+      requestGatewaySupervisorAction,
+      waitForRecoveredSandboxGatewayImpl,
+      waitForRecreatedSandboxOpenShellReadyImpl,
+    });
+
+    expect(result).toMatchObject({
+      checked: true,
+      wasRunning: false,
+      recovered: true,
+      forwardRecovered: true,
+    });
+    expect(recover).toHaveBeenCalledWith(expect.objectContaining({ name: sandboxName }));
+    expect(waitForRecoveredSandboxGatewayImpl).toHaveBeenCalledOnce();
+    expect(waitForRecreatedSandboxOpenShellReadyImpl).toHaveBeenCalledOnce();
+    expect(requestGatewaySupervisorAction).not.toHaveBeenCalled();
+  });
+
+  it("returns a Podman provider failure without restoring forwards", async () => {
+    const sandboxName = "podman-failure";
+    mockGatewaySandbox(sandboxName, "openclaw", "podman");
+    mockRecoveredForward(sandboxName);
+    const recover = vi.fn(() => ({
+      exitCode: 1,
+      message: "Podman recovery is unavailable.",
+    }));
+    vi.spyOn(runtimeProviderSelection, "resolveRegisteredRuntimeProvider").mockReturnValue({
+      gateway: { supported: true, launcher: "nemoclaw" },
+      lifecycle: { supported: true },
+      recovery: { supported: true, recover },
+    } as never);
+    const requestGatewaySupervisorAction = vi.fn();
+    const waitForRecoveredSandboxGatewayImpl = vi.fn(async () => true);
+
+    const result = await checkAndRecoverSandboxProcesses(sandboxName, {
+      quiet: true,
+      isSandboxGatewayRunningImpl: async () => false,
+      requestGatewaySupervisorAction,
+      waitForRecoveredSandboxGatewayImpl,
+    });
+
+    expect(result).toMatchObject({
+      checked: true,
+      wasRunning: false,
+      recovered: false,
+      forwardRecovered: false,
+      recoveryFailureDetail: "Podman recovery is unavailable.",
+    });
+    expect(recover).toHaveBeenCalledWith(expect.objectContaining({ name: sandboxName }));
+    expect(waitForRecoveredSandboxGatewayImpl).not.toHaveBeenCalled();
+    expect(forwardHealth.isLocalForwardReachable).not.toHaveBeenCalled();
+    expect(requestGatewaySupervisorAction).not.toHaveBeenCalled();
+  });
+
+  it("does not dispatch host-local Podman recovery for an explicitly selected runtime", async () => {
+    const sandboxName = "selected-podman";
+    mockGatewaySandbox(sandboxName, "openclaw", "podman");
+    const recover = vi.fn(() => ({ exitCode: 0 }));
+    vi.spyOn(runtimeProviderSelection, "resolveRegisteredRuntimeProvider").mockReturnValue({
+      gateway: { supported: true, launcher: "nemoclaw" },
+      lifecycle: { supported: true },
+      recovery: { supported: true, recover },
+    } as never);
+    const requestGatewaySupervisorAction = vi.fn();
+
+    const result = await checkAndRecoverSandboxProcesses(sandboxName, {
+      quiet: true,
+      isSandboxGatewayRunningImpl: async () => false,
+      requestGatewaySupervisorAction,
+      runtimeSelection: { gatewayName: "selected-gateway", workspace: "default" },
+    });
+
+    expect(result).toMatchObject({
+      checked: true,
+      wasRunning: false,
+      recovered: false,
+      forwardRecovered: false,
+      recoveryFailureDetail: expect.stringContaining("host-local"),
+    });
+    expect(recover).not.toHaveBeenCalled();
+    expect(requestGatewaySupervisorAction).not.toHaveBeenCalled();
+  });
+
+  it("describes provider readiness failure without obsolete replacement wording", async () => {
+    const sandboxName = "podman-readiness-failure";
+    mockGatewaySandbox(sandboxName, "openclaw", "podman");
+    const recover = vi.fn(() => ({ exitCode: 0 }));
+    vi.spyOn(runtimeProviderSelection, "resolveRegisteredRuntimeProvider").mockReturnValue({
+      gateway: { supported: true, launcher: "nemoclaw" },
+      lifecycle: { supported: true },
+      recovery: { supported: true, recover },
+    } as never);
+
+    const result = await checkAndRecoverSandboxProcesses(sandboxName, {
+      quiet: true,
+      isSandboxGatewayRunningImpl: async () => false,
+      waitForRecoveredSandboxGatewayImpl: async () => true,
+      waitForRecreatedSandboxOpenShellReadyImpl: async () => false,
+    });
+
+    expect(result).toMatchObject({
+      checked: true,
+      wasRunning: false,
+      recovered: false,
+      forwardRecovered: false,
+      recoveryFailureDetail:
+        "the sandbox did not become ready in OpenShell after gateway recovery. NemoClaw did not start the primary dashboard/API host forward",
+    });
+    expect(result.recoveryFailureDetail).not.toMatch(/recreated|replacement/u);
+  });
+
   it.each([
     ["SUPERVISOR_NOT_RUNNING", false],
     ["SUPERVISOR_DISCOVERY_PENDING", false],
@@ -86,13 +255,10 @@ describe("checkAndRecoverSandboxProcesses managed startup", () => {
           ...(discovery ? { managedContainerDiscoveryUnavailable: true as const } : {}),
         })
         .mockReturnValueOnce(ACCEPTED_MANAGED_RECOVERY);
-      const relaunchManagedSupervisorSessionImpl = vi.fn(() => null);
-
       const result = await checkAndRecoverSandboxProcesses(sandboxName, {
         quiet: true,
         isSandboxGatewayRunningImpl: async () => false,
         requestGatewaySupervisorAction,
-        relaunchManagedSupervisorSessionImpl,
         waitForRecreatedSandboxOpenShellReadyImpl: async () => true,
       });
 
@@ -103,7 +269,6 @@ describe("checkAndRecoverSandboxProcesses managed startup", () => {
         forwardRecovered: true,
       });
       expect(requestGatewaySupervisorAction).toHaveBeenCalledTimes(2);
-      expect(relaunchManagedSupervisorSessionImpl).not.toHaveBeenCalled();
     },
   );
 
@@ -116,13 +281,10 @@ describe("checkAndRecoverSandboxProcesses managed startup", () => {
       stdout: "",
       stderr: "SUPERVISOR_DISCOVERY_PENDING\nunexpected diagnostic",
     }));
-    const relaunchManagedSupervisorSessionImpl = vi.fn(() => null);
-
     const result = await checkAndRecoverSandboxProcesses(sandboxName, {
       quiet: true,
       isSandboxGatewayRunningImpl: async () => false,
       requestGatewaySupervisorAction,
-      relaunchManagedSupervisorSessionImpl,
     });
 
     expect(result).toMatchObject({
@@ -132,7 +294,6 @@ describe("checkAndRecoverSandboxProcesses managed startup", () => {
       forwardRecovered: false,
     });
     expect(requestGatewaySupervisorAction).toHaveBeenCalledOnce();
-    expect(relaunchManagedSupervisorSessionImpl).not.toHaveBeenCalled();
   });
 
   it("does not retry a managed-container identity mismatch (#9466)", async () => {
@@ -146,13 +307,10 @@ describe("checkAndRecoverSandboxProcesses managed startup", () => {
         `PRIVILEGED_CONTROL_UNAVAILABLE: OpenShell container identity changed for sandbox ` +
         `'${sandboxName}'; refusing privileged execution against a different container.`,
     }));
-    const relaunchManagedSupervisorSessionImpl = vi.fn(() => null);
-
     const result = await checkAndRecoverSandboxProcesses(sandboxName, {
       quiet: true,
       isSandboxGatewayRunningImpl: async () => false,
       requestGatewaySupervisorAction,
-      relaunchManagedSupervisorSessionImpl,
     });
 
     expect(result).toMatchObject({
@@ -162,7 +320,6 @@ describe("checkAndRecoverSandboxProcesses managed startup", () => {
       forwardRecovered: false,
     });
     expect(requestGatewaySupervisorAction).toHaveBeenCalledOnce();
-    expect(relaunchManagedSupervisorSessionImpl).not.toHaveBeenCalled();
   });
 
   it("shares one deadline across managed recovery controller calls (#11107)", async () => {
@@ -327,17 +484,13 @@ describe("managed container discovery settlement", () => {
     expect({ calls, seconds }).toEqual({ calls: 31, seconds: 90 });
   });
 
-  it("waits through supervisor startup before recreation after delayed discovery (#11107)", async () => {
+  it("stops after delayed discovery proves the native supervisor is absent (#11107)", async () => {
     const sandboxName = "hermes-discovery";
     mockGatewaySandbox(sandboxName, "hermes");
     vi.stubEnv("NEMOCLAW_GATEWAY_RECOVERY_POLL_INTERVAL_SECONDS", "3");
     let seconds = 0;
     vi.spyOn(wait, "sleepSeconds").mockImplementation((duration) => {
       seconds += duration;
-    });
-    const relaunch = vi.fn(() => {
-      expect(seconds).toBe(66);
-      return null;
     });
     const result = await checkAndRecoverSandboxProcesses(sandboxName, {
       quiet: true,
@@ -349,10 +502,9 @@ describe("managed container discovery settlement", () => {
           seconds < 36 ? PENDING_MANAGED_CONTAINER_DISCOVERY.stderr : "SUPERVISOR_NOT_RUNNING",
         ...(seconds < 36 ? { managedContainerDiscoveryUnavailable: true as const } : {}),
       }),
-      relaunchManagedSupervisorSessionImpl: relaunch,
     });
     expect(result.recovered).toBe(false);
-    expect(relaunch).toHaveBeenCalledOnce();
+    expect(seconds).toBe(66);
   });
 
   it("honors an explicit shorter discovery bound (#11107)", () => {
@@ -384,17 +536,14 @@ describe("managed container discovery settlement", () => {
       vi.spyOn(wait, "sleepSeconds").mockImplementation((duration) => {
         seconds += duration;
       });
-      const relaunch = vi.fn(() => null);
       const result = await checkAndRecoverSandboxProcesses(sandboxName, {
         quiet: true,
         isSandboxGatewayRunningImpl: async () => false,
         requestGatewaySupervisorAction: () =>
           seconds >= readyAt ? ACCEPTED_MANAGED_RECOVERY : PENDING_MANAGED_CONTAINER_DISCOVERY,
-        relaunchManagedSupervisorSessionImpl: relaunch,
         waitForRecreatedSandboxOpenShellReadyImpl: async () => true,
       });
       expect({ recovered: result.recovered, elapsed: seconds }).toEqual({ recovered, elapsed });
-      expect(relaunch).not.toHaveBeenCalled();
     },
   );
 });
