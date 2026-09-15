@@ -331,7 +331,6 @@ const {
 }: typeof import("./onboard/onboard-exit-handler") = require("./onboard/onboard-exit-handler");
 const {
   getFutureShellPathHint,
-  getPortConflictServiceHints,
 }: typeof import("./onboard/remediation") = require("./onboard/remediation");
 const resumeConfig: typeof import("./onboard/resume-config") = require("./onboard/resume-config");
 const {
@@ -567,7 +566,6 @@ const {
   isDockerDriverGatewayPortListener,
   isDockerDriverGatewayProcess,
   isDockerDriverGatewayProcessAlive,
-  isDockerDriverGatewayStateInUse,
   isPidAlive,
   rememberDockerDriverGatewayPid,
   resolveOpenShellGatewayBinary,
@@ -1255,7 +1253,6 @@ async function preflight(
         label,
         envVar,
         portCheck,
-        serviceHints: getPortConflictServiceHints(),
       });
       process.exit(1);
     }
@@ -1369,10 +1366,11 @@ const dockerDriverGatewayStart = createDockerDriverGatewayStart({
   getDockerDriverGatewayPortListenerScan,
   getDockerDriverGatewayRuntimeDrift,
   getDockerDriverGatewayStateDir,
+  getGatewayPortListenerRawScan,
   getInstalledOpenshellVersion,
   isDockerDriverGatewayHttpReady,
+  isDockerDriverGatewayProcess,
   isDockerDriverGatewayProcessAlive,
-  isDockerDriverGatewayStateInUse,
   isGatewayHealthy,
   isGatewayTcpReady,
   isPidAlive,
@@ -1381,6 +1379,7 @@ const dockerDriverGatewayStart = createDockerDriverGatewayStart({
   rememberDockerDriverGatewayPid,
   resolveOpenShellGatewayBinary,
   resolveOpenShellSandboxBinary,
+  runner,
   runCaptureOpenshell,
   sleepSeconds,
 });
@@ -3407,7 +3406,6 @@ module.exports = {
   clearAgentScopedResumeState: runtimeControlFlow.clearAgentScopedResumeState,
   getSandboxReuseState,
   getSandboxStateFromOutputs,
-  getPortConflictServiceHints,
   classifyValidationFailure,
   isSandboxReady,
   isLoopbackHostname,
