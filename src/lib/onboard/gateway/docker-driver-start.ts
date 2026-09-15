@@ -67,6 +67,7 @@ export interface DockerDriverGatewayStartDeps {
   logDockerDriverGatewayRestart(reason: string): void;
   registerDockerDriverGatewayEndpoint(runtimeSelection?: OpenShellRuntimeSelection): boolean;
   rememberDockerDriverGatewayPid: GatewayRuntimeHelpers["rememberDockerDriverGatewayPid"];
+  readDockerDriverGatewayProcessEnvironment?: (pid: number) => Record<string, string> | null;
   resolveOpenShellGatewayBinary: GatewayRuntimeHelpers["resolveOpenShellGatewayBinary"];
   resolveOpenShellSandboxBinary: GatewayRuntimeHelpers["resolveOpenShellSandboxBinary"];
   runner: Pick<typeof import("../../runner"), "runCapture" | "runCaptureEx">;
@@ -148,11 +149,12 @@ export function createDockerDriverGatewayStart(
   deps: DockerDriverGatewayStartDeps,
 ): DockerDriverGatewayStart {
   const stateOwnership = createDockerDriverGatewayStateOwnership({
+    getDockerDriverGatewayPid: deps.getDockerDriverGatewayPid,
     getDockerDriverGatewayStateDir: deps.getDockerDriverGatewayStateDir,
     isDockerDriverGatewayProcess: deps.isDockerDriverGatewayProcess,
     isPidAlive: deps.isPidAlive,
+    readProcessEnvironment: deps.readDockerDriverGatewayProcessEnvironment,
     resolveOpenShellGatewayBinary: deps.resolveOpenShellGatewayBinary,
-    runCapture: deps.runner.runCapture,
     runCaptureEx: deps.runner.runCaptureEx,
   });
 

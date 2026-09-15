@@ -44,7 +44,7 @@ describe("gateway lifecycle late binding", () => {
     ).toBe("https://127.0.0.1:8080");
   });
 
-  it("withholds a stop command when the active service uses another state (#11720)", async () => {
+  it("prints a stop command when the active service owns the selected listener and state", async () => {
     const root = fs.mkdtempSync(path.join(process.cwd(), "nemoclaw-gateway-port-recovery-"));
     const stateDir = path.join(root, "gateway");
     const lines: string[] = [];
@@ -53,9 +53,10 @@ describe("gateway lifecycle late binding", () => {
       pid: 5444,
       stopCommand: "systemctl --user stop openshell-gateway",
     }));
-    const readProcessEnvironment = vi.fn(
-      () => "NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE=another-gateway",
-    );
+    const readProcessEnvironment = vi.fn(() => ({
+      NEMOCLAW_OPENSHELL_SANDBOX_NAMESPACE: gatewayIdForStateDir(stateDir),
+    }));
+    const runCapture = vi.fn(() => "");
     const checkGatewayPortAvailable = vi
       .fn()
       .mockResolvedValueOnce({ ok: true })
@@ -141,11 +142,12 @@ describe("gateway lifecycle late binding", () => {
         logDockerDriverGatewayRestart: vi.fn(),
         registerDockerDriverGatewayEndpoint: () => false,
         rememberDockerDriverGatewayPid: vi.fn(),
+        readDockerDriverGatewayProcessEnvironment: readProcessEnvironment,
         resolveOpenShellGatewayBinary: () => "/opt/openshell/openshell-gateway",
         resolveOpenShellSandboxBinary: () => null,
         runner: {
-          runCapture: readProcessEnvironment,
-          runCaptureEx: () => ({ stdout: "", exitCode: null, timedOut: true }),
+          runCapture,
+          runCaptureEx: () => ({ stdout: "5444\n", exitCode: 0, timedOut: false }),
         },
         runCaptureOpenshell: () => "",
         sleepSeconds: vi.fn(),
@@ -163,14 +165,12 @@ describe("gateway lifecycle late binding", () => {
         }),
       ).rejects.toThrow(/failed to start within/);
 
-      expect(lines.join("\n")).toContain("sudo lsof -i :9777 -sTCP:LISTEN -P -n");
-      expect(lines.join("\n")).not.toContain("sudo lsof -iTCP -sTCP:LISTEN -P -n");
-      expect(lines.join("\n")).not.toContain("systemctl --user stop openshell-gateway");
-      expect(serviceTarget).toHaveBeenCalledOnce();
-      expect(readProcessEnvironment).toHaveBeenCalledWith(
-        ["ps", "eww", "-p", "5444", "-o", "command="],
-        { ignoreError: true },
-      );
+      expect(lines.join("\n")).toContain("systemctl --user stop openshell-gateway");
+      expect(lines.join("\n")).toContain("nemoclaw onboard --resume");
+      expect(lines.join("\n")).not.toContain("sudo lsof -i :9777 -sTCP:LISTEN -P -n");
+      expect(serviceTarget).toHaveBeenCalledTimes(2);
+      expect(readProcessEnvironment).toHaveBeenCalledWith(5444);
+      expect(runCapture).not.toHaveBeenCalled();
     } finally {
       spawnSpy.mockRestore();
       prepareSpy.mockRestore();
@@ -200,6 +200,29 @@ describe("gateway lifecycle late binding", () => {
         isDockerDriverGatewayPidUsingSelectedState: () => true,
       }),
     ).resolves.toBe(serviceTarget.stopCommand);
+  });
+
+  it("withholds a stop command when the active service PID differs from the selected listener", async () => {
+    const serviceTarget = {
+      executablePath: "/opt/openshell/openshell-gateway",
+      pid: 5444,
+      stopCommand: "systemctl --user stop openshell-gateway",
+    };
+    const stateOwner = vi.fn(() => true);
+
+    await expect(
+      resolveSelectedGatewayServiceStopCommand({
+        checkGatewayPortAvailable: async () => ({
+          ok: false,
+          pid: 6444,
+          process: "openshell-gateway",
+        }),
+        getGatewayPortListenerRawScan: () => ({ complete: true, pids: [6444] }),
+        getTrustedActiveOpenShellGatewayUserServiceStopTarget: () => serviceTarget,
+        isDockerDriverGatewayPidUsingSelectedState: stateOwner,
+      }),
+    ).resolves.toBeNull();
+    expect(stateOwner).not.toHaveBeenCalled();
   });
 
   it("withholds a stop command when the service identity changes during ownership proof", async () => {
