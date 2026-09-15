@@ -21,7 +21,7 @@ describe("getReconciledSandboxGatewayState owning-gateway guard", () => {
       gatewayPort: 8091,
       registryFile: "/test/sandboxes.json",
     });
-    vi.spyOn(gatewaySelect, "selectSandboxOwningGateway").mockReturnValue({
+    vi.spyOn(gatewaySelect, "selectSandboxOwningGateway").mockResolvedValue({
       outcome: "selected",
       gatewayName: "nemoclaw-8091",
     });
@@ -137,7 +137,7 @@ describe("getReconciledSandboxGatewayState owning-gateway guard", () => {
   });
 
   it("queries the gateway returned by selection when registry ownership changes between snapshots", async () => {
-    vi.mocked(gatewaySelect.selectSandboxOwningGateway).mockReturnValue({
+    vi.mocked(gatewaySelect.selectSandboxOwningGateway).mockResolvedValue({
       outcome: "selected",
       gatewayName: "nemoclaw-8092",
     });
@@ -151,7 +151,7 @@ describe("getReconciledSandboxGatewayState owning-gateway guard", () => {
   });
 
   it("keeps recovery pinned to the gateway returned by selection after ownership changes", async () => {
-    vi.mocked(gatewaySelect.selectSandboxOwningGateway).mockReturnValue({
+    vi.mocked(gatewaySelect.selectSandboxOwningGateway).mockResolvedValue({
       outcome: "selected",
       gatewayName: "nemoclaw-8092",
     });
@@ -208,7 +208,7 @@ describe("getReconciledSandboxGatewayState owning-gateway guard", () => {
   });
 
   it("fails closed before lookup when the owning gateway cannot be selected", async () => {
-    vi.mocked(gatewaySelect.selectSandboxOwningGateway).mockReturnValue({
+    vi.mocked(gatewaySelect.selectSandboxOwningGateway).mockResolvedValue({
       outcome: "failed",
       gatewayName: "nemoclaw-8091",
     });
