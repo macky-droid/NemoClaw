@@ -249,10 +249,12 @@ function stageOptimizedSandboxBuildContext(
   normalizeReadModesForDockerCopy(stagedNemoclawDir);
 
   fs.mkdirSync(stagedBlueprintDir, { recursive: true });
-  fs.copyFileSync(
-    path.join(sourceBlueprintDir, "blueprint.yaml"),
-    path.join(stagedBlueprintDir, "blueprint.yaml"),
-  );
+  for (const fileName of ["blueprint.yaml", "private-networks.yaml"]) {
+    fs.copyFileSync(
+      path.join(sourceBlueprintDir, fileName),
+      path.join(stagedBlueprintDir, fileName),
+    );
+  }
   fs.cpSync(path.join(sourceBlueprintDir, "policies"), path.join(stagedBlueprintDir, "policies"), {
     recursive: true,
   });
@@ -272,6 +274,16 @@ function stageOptimizedSandboxBuildContext(
     {
       recursive: true,
     },
+  );
+  fs.cpSync(
+    path.join(sourceBlueprintDir, "provider-profiles"),
+    path.join(stagedBlueprintDir, "provider-profiles"),
+    { recursive: true },
+  );
+  fs.mkdirSync(path.join(stagedBlueprintDir, "router"), { recursive: true });
+  fs.copyFileSync(
+    path.join(sourceBlueprintDir, "router", "pool-config.yaml"),
+    path.join(stagedBlueprintDir, "router", "pool-config.yaml"),
   );
   normalizeReadModesForDockerCopy(stagedBlueprintDir);
 
@@ -350,6 +362,10 @@ function stageOptimizedSandboxBuildContext(
   fs.copyFileSync(
     path.join(rootDir, "scripts", "lib", "openclaw_device_approval_policy.py"),
     path.join(stagedScriptsDir, "lib", "openclaw_device_approval_policy.py"),
+  );
+  fs.copyFileSync(
+    path.join(rootDir, "scripts", "lib", "openclaw_pairing_state.py"),
+    path.join(stagedScriptsDir, "lib", "openclaw_pairing_state.py"),
   );
   fs.copyFileSync(
     path.join(rootDir, "scripts", "lib", "normalize_mutable_config_perms.py"),
